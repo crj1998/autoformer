@@ -1,5 +1,5 @@
 
-import os, logging, argparse, sys
+import os, logging, argparse, random
 import wandb
 from copy import deepcopy
 from contextlib import contextmanager
@@ -27,6 +27,47 @@ from timm.optim import create_optimizer
 
 from utils import get_logger, get_config, colorstr, setup_seed, unwrap_model, AverageMeter
 from model import VisionTransformer
+from sam import SAM
+
+class AutoFormerSpace:
+    def __init__(self, search_embed_dim, search_depth, search_num_heads, search_num_ratio):
+        self.search_embed_dim = search_embed_dim
+        self.search_depth = search_depth
+        self.search_num_heads = search_num_heads
+        self.search_num_ratio = search_num_ratio
+        self.depth = max(search_depth)
+
+        self.config = None
+
+    def random(self):
+        config = {
+            "embed_dim": random.choice(self.search_embed_dim),
+            "depth": random.choice(self.search_depth),
+            "num_heads": [random.choice(self.search_num_heads) for _ in range(self.depth)],
+            "mlp_ratio": [random.choice(self.search_num_ratio) for _ in range(self.depth)]
+        }
+        self.config = config
+        return config
+    
+    def min(self):
+        config = {
+            "embed_dim": min(self.search_embed_dim),
+            "depth": min(self.search_depth),
+            "num_heads": [min(self.search_num_heads) for _ in range(self.depth)],
+            "mlp_ratio": [min(self.search_num_ratio) for _ in range(self.depth)]
+        }
+        self.config = config
+        return config
+
+    def max(self):
+        config = {
+            "embed_dim": max(self.search_embed_dim),
+            "depth": max(self.search_depth),
+            "num_heads": [max(self.search_num_heads) for _ in range(self.depth)],
+            "mlp_ratio": [max(self.search_num_ratio) for _ in range(self.depth)]
+        }
+        self.config = config
+        return config
 
 @contextmanager
 def torch_distributed_zero_first(rank):
@@ -60,7 +101,7 @@ def valid(args, model, dataloader, criterion):
 
     return Loss.item(), Acc.item()
 
-def train(args, model, dataloader, criterion, optimizer, scheduler, mixup_fn=None, teacher_model=None):
+def train(args, model, dataloader, criterion, optimizer, scheduler, mixup_fn=None, search_space=None, teacher_model=None):
     epoch, iters = args.epoch, args.valid_step
     Loss = AverageMeter()
     dataiter = iter(dataloader)
@@ -78,23 +119,36 @@ def train(args, model, dataloader, criterion, optimizer, scheduler, mixup_fn=Non
         inputs, targets = inputs.to(args.device, non_blocking=True), targets.to(args.device, non_blocking=True)
         if mixup_fn is not None:
             inputs, targets = mixup_fn(inputs, targets)
-
+        if args.sample == "random":
+            unwrap_model(model).set_sample_config(search_space.random())
         logits = model(inputs)
-        if teacher_model is not None:
-            with torch.no_grad():
-                teacher_logits = teacher_model(inputs)
-            loss = F.kl_div(
-                F.log_softmax(logits / args.distill_temp, dim=-1),
-                F.softmax(teacher_logits / args.distill_temp, dim=-1),
-                reduction="batchmean"
-            ) * (args.distill_temp ** 2)
-        else:
-            loss = criterion(logits, targets)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
+        if args.sam:
+            # first forward-backward pass
+            loss = criterion(logits, targets)  # use this loss for any training statistics
+            loss.backward()
+            optimizer.first_step(zero_grad=True)
+
+            # second forward-backward pass
+            criterion(model(inputs), targets).backward()  # make sure to do a full forward pass
+            optimizer.second_step(zero_grad=True)
+
+        else:
+            if teacher_model is not None:
+                with torch.no_grad():
+                    teacher_logits = teacher_model(inputs)
+                loss = F.kl_div(
+                    F.log_softmax(logits / args.distill_temp, dim=-1),
+                    F.softmax(teacher_logits / args.distill_temp, dim=-1),
+                    reduction="batchmean"
+                ) * (args.distill_temp ** 2)
+            else:
+                loss = criterion(logits, targets)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
         Loss.update(loss.item(), batch_size)
 
         if args.local_rank in [-1, 0] and ((it+1) % args.log_interval == 0 or it+1 == iters or it == 0):
@@ -120,8 +174,8 @@ def main(args):
     args.logger = logger
     logger.debug(f"Get logger named {colorstr('AutoFormer')}!")
     logger.debug(f"Distributed available? {colorstr(str(dist.is_available()))}")
-    
-    if args.local_rank in [-1, 0]:
+
+    if args.local_rank in [-1, 0] and args.wandb:
         wandb.init(project="autoformer", entity="maze", name=args.out.split("/")[-1], config=cfg.state_dict())
     #setup random seed
     if args.seed is not None and isinstance(args.seed, int):
@@ -205,6 +259,7 @@ def main(args):
         label_smoothing=aug.smoothing, num_classes=num_classes
     ) if mixup_active else None
 
+    search_space = AutoFormerSpace(cfg.search_space.search_embed_dim, cfg.search_space.search_depth, cfg.search_space.search_num_heads, cfg.search_space.search_num_ratio)
     with torch_distributed_zero_first(args.local_rank):
         # build model
         cfg.model.num_classes = num_classes
@@ -231,9 +286,10 @@ def main(args):
     if args.teacher:
         teacher_model.to(args.device)
     total_epoch = cfg.scheduler.epochs
-    warmup_epoch = 2
     args.total_step = len(train_loader) * total_epoch
     args.valid_step = len(train_loader)
+    args.sam = cfg.train.sam
+    args.sample = cfg.train.sample
     # criterion = nn.CrossEntropyLoss(reduction='mean').to(args.device)
     # optimizer = optim.AdamW(unwrap_model(model).parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-08)
     # scheduler = cosine_schedule_with_warmup(
@@ -248,24 +304,41 @@ def main(args):
         criterion = nn.CrossEntropyLoss()
     criterion_valid = nn.CrossEntropyLoss()
     optimizer = create_optimizer(cfg.optimizer, unwrap_model(model))
+    if args.sam:
+        # optimizer.__class__(optimizer.param_groups, **optimizer.defaults)
+        optimizer = SAM(unwrap_model(model).parameters(), optimizer.__class__, rho=0.05, **optimizer.defaults)
+        
     scheduler, _ = create_scheduler(cfg.scheduler, optimizer)
 
     logger.info(f"Optimizer {colorstr('Adamw')} and Scheduler {colorstr('Cosine')} selected!")
 
     if args.local_rank != -1:
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=False)
+        # This mode allows running backward on a subgraph of the model, and DDP finds out which parameters are involved in the backward pass by traversing the autograd graph from the model output and marking all unused parameters as ready for reduction. 
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
     
     best_acc = 0.0
     args.global_step = 0
     args.epoch = 0
     #train loop
     model.zero_grad()
-
+    
     for epoch in range(1, total_epoch+1):
         args.epoch = epoch
         if args.local_rank != -1:
             train_loader.sampler.set_epoch(epoch)
-        train_loss = train(args, model, train_loader, criterion, optimizer, scheduler, mixup_fn, teacher_model)
+        if args.sample in ["random", "max"]:
+            unwrap_model(model).set_sample_config(search_space.max())
+        elif args.sample == "min":
+            unwrap_model(model).set_sample_config(search_space.min())
+        else:
+            pass
+        train_loss = train(args, model, train_loader, criterion, optimizer, scheduler, mixup_fn, search_space, teacher_model)
+        if args.sample in ["random", "max"]:
+            unwrap_model(model).set_sample_config(search_space.max())
+        elif args.sample == "min":
+            unwrap_model(model).set_sample_config(search_space.min())
+        else:
+            pass
         valid_loss, valid_acc = valid(args, model, valid_loader, criterion_valid)
         if args.local_rank in [-1, 0]:
             if valid_acc > best_acc:
@@ -274,12 +347,13 @@ def main(args):
             torch.save(unwrap_model(model).state_dict(), os.path.join(args.out, "last_model.pth"))
             lr = optimizer.param_groups[0]['lr']
             logger.info(f"LR: {lr:.8f} Train loss: {train_loss:.3f} Valid loss: {valid_loss:.3f} Valid acc: {valid_acc:.2%}")
-            wandb.log({
-                "train/loss": round(train_loss, 4),
-                "train/lr": round(lr, 8),
-                "valid/loss": round(valid_loss, 4),
-                "valid/acc": round(valid_acc, 4)
-            }, step=epoch)
+            if args.wandb:
+                wandb.log({
+                    "train/loss": round(train_loss, 4),
+                    "train/lr": round(lr, 8),
+                    "valid/loss": round(valid_loss, 4),
+                    "valid/acc": round(valid_acc, 4)
+                }, step=epoch)
 
 if __name__ == '__main__':
     
@@ -290,6 +364,7 @@ if __name__ == '__main__':
     # parser.add_argument('--resume', default='', type=str, help='path to latest checkpoint (default: none)')
     parser.add_argument('--seed', default=42, type=int, help="random seed")
     parser.add_argument('--log_interval', default=64, type=int, help="log print interval")
+    parser.add_argument('--wandb', action="store_true", help="use wandb")
     parser.add_argument('--override', default='', type=str, help='overwrite the config, keys are split by space and args split by |, such as train.eval_step=2048|optimizer.lr=0.1')
     args = parser.parse_args()
 

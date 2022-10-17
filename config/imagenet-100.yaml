@@ -60,6 +60,7 @@ optimizer:
   momentum: 0.9
   weight_decay: 0.05
 
+
 scheduler:
   sched: cosine
   epochs: 400
@@ -76,3 +77,6 @@ scheduler:
   patience_epochs: 10
   decay_rate: 0.1
 
+train:
+  sam: true
+  sample: random
