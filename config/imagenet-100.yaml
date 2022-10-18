@@ -79,4 +79,5 @@ scheduler:
 
 train:
   sam: true
+  sam_rho: 0.1
   sample: random

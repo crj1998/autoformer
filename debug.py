@@ -18,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampl
 import torchvision.models as models
 
 
-from utils import get_config
+from utils import get_config, setup_seed, unwrap_model
 from model import VisionTransformer
 
 device = torch.device("cuda:0")
@@ -93,17 +93,111 @@ class AutoFormerSpace:
         self.config = config
         return config
 
+setup_seed(42)
 cfg = get_config("config/imagenet-100.yaml", "")
-# print(cfg.state_dict())
-autoformer = AutoFormerSpace(cfg.search_space.search_embed_dim, cfg.search_space.search_depth, cfg.search_space.search_num_heads, cfg.search_space.search_num_ratio)
+search_space = AutoFormerSpace(cfg.search_space.search_embed_dim, cfg.search_space.search_depth, cfg.search_space.search_num_heads, cfg.search_space.search_num_ratio)
 
 cfg.model.num_classes = cfg.data.num_classes
 model = VisionTransformer(**cfg.model).to(device)
 
-config = autoformer.min()
+# from sam import SAM
+
+class SAM(torch.optim.Optimizer):
+    def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, **kwargs):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+
+        defaults = dict(rho=rho, adaptive=adaptive, **kwargs)
+        super(SAM, self).__init__(params, defaults)
+
+        self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+        self.defaults.update(self.base_optimizer.defaults)
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group["rho"] / (grad_norm + 1e-12)
+
+            for p in group["params"]:
+                if p.grad is None: continue
+                self.state[p]["old_p"] = p.data.clone()
+                e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * p.grad * scale.to(p)
+                p.add_(e_w)  # climb to the local maximum "w + e(w)"
+
+        if zero_grad: self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None: continue
+                p.data = self.state[p]["old_p"]  # get back to "w" from "w + e(w)"
+
+        self.base_optimizer.step()  # do the actual "sharpness-aware" update
+
+        if zero_grad: self.zero_grad()
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        assert closure is not None, "Sharpness Aware Minimization requires closure, but it was not provided"
+        closure = torch.enable_grad()(closure)  # the closure should do a full forward-backward pass
+
+        self.first_step(zero_grad=True)
+        closure()
+        self.second_step()
+
+    def _grad_norm(self):
+        shared_device = self.param_groups[0]["params"][0].device  # put everything on the same device, in case of model parallelism
+        norm = torch.stack([
+            ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).norm(p=2).to(shared_device)
+            for group in self.param_groups for p in group["params"] if p.grad is not None
+        ])
+        norm = torch.norm(norm, p=2)
+        
+        return norm
+
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.base_optimizer.param_groups = self.param_groups
+
+sam = True
+criterion = nn.CrossEntropyLoss(reduction='mean').to(device)
+optimizer = optim.AdamW(unwrap_model(model).parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-08)
+if sam:
+    optimizer = SAM(unwrap_model(model).parameters(), optimizer.__class__, rho=0.05, **optimizer.defaults)
+
+for it in range(8):
+    inputs, targets = torch.rand(8, 3, 224, 224), torch.randint(0, 100, (8, ))
+    batch_size = inputs.size(0)
+    inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+    unwrap_model(model).set_sample_config(search_space.random())
+    logits = model(inputs)
+
+    if sam:
+        # first forward-backward pass
+        loss = criterion(logits, targets)  # use this loss for any training statistics
+        loss.backward()
+        optimizer.first_step(zero_grad=True)
+
+        # second forward-backward pass
+        criterion(model(inputs), targets).backward()  # make sure to do a full forward pass
+        optimizer.second_step(zero_grad=True)
+
+    else:
+        loss = criterion(logits, targets)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    print(it, loss.item())
+
+exit()
+
+config = search_space.min()
 model.set_sample_config(config)
 min_params = model.get_params()/1e6
-config = autoformer.max()
+config = search_space.max()
 model.set_sample_config(config)
 max_params = model.get_params()/1e6
 

@@ -88,15 +88,19 @@ def reduce_mean(tensor, nprocs):
 def valid(args, model, dataloader, criterion):
     Acc = AverageMeter()
     Loss = AverageMeter()
+    model.eval()
     for inputs, targets in dataloader:
         batch_size = inputs.size(0)
         inputs, targets = inputs.to(args.device), targets.to(args.device)
         logits = model(inputs)
         loss = criterion(logits, targets)
         acc = (logits.argmax(dim=-1)==targets).sum()/batch_size
-        dist.barrier()
-        reduced_acc = reduce_mean(acc, args.world_size)
-        Acc.update(reduced_acc.item(), batch_size)
+        if args.local_rank != -1:
+            dist.barrier()
+            reduced_acc = reduce_mean(acc, args.world_size)
+            Acc.update(reduced_acc.item(), batch_size)
+        else:
+            Acc.update(acc.item(), batch_size)
         Loss.update(loss.item(), batch_size)
 
     return Loss.item(), Acc.item()
@@ -106,8 +110,9 @@ def train(args, model, dataloader, criterion, optimizer, scheduler, mixup_fn=Non
     Loss = AverageMeter()
     dataiter = iter(dataloader)
     model.train()
-    # lr = scheduler.get_last_lr()[0]
-    # lr = optimizer.param_groups[0]['lr']
+    # let all processes sync up before starting with a new epoch of training
+    if args.local_rank != -1:
+        dist.barrier()
     for it in range(iters):
         try:
             inputs, targets = next(dataiter)
@@ -121,19 +126,21 @@ def train(args, model, dataloader, criterion, optimizer, scheduler, mixup_fn=Non
             inputs, targets = mixup_fn(inputs, targets)
         if args.sample == "random":
             unwrap_model(model).set_sample_config(search_space.random())
-        logits = model(inputs)
-
+        
         if args.sam:
-            # first forward-backward pass
-            loss = criterion(logits, targets)  # use this loss for any training statistics
-            loss.backward()
-            optimizer.first_step(zero_grad=True)
+            with model.no_sync():  # <- this is the important line
+                # first forward-backward pass
+                logits = model(inputs)
+                loss = criterion(logits, targets)  # use this loss for any training statistics
+                loss.backward()
+                optimizer.first_step(zero_grad=True)
 
             # second forward-backward pass
             criterion(model(inputs), targets).backward()  # make sure to do a full forward pass
             optimizer.second_step(zero_grad=True)
 
         else:
+            logits = model(inputs)
             if teacher_model is not None:
                 with torch.no_grad():
                     teacher_logits = teacher_model(inputs)
@@ -247,6 +254,8 @@ def main(args):
         "persistent_workers": True
     }
     train_loader = DataLoader(train_set, sampler=train_sampler(train_set), **dataloader_config)
+    dataloader_config["drop_last"] = False
+    dataloader_config["batch_size"] = 250
     valid_loader = DataLoader(valid_set, sampler=valid_sampler(valid_set), **dataloader_config)
 
     logger.info(f"Dataloader Initialized. Batch num: {colorstr('green', len(train_loader))}, Batch size: {colorstr('green', batch_size)}, Num workers: {colorstr('green', num_workers)}.")
@@ -306,7 +315,7 @@ def main(args):
     optimizer = create_optimizer(cfg.optimizer, unwrap_model(model))
     if args.sam:
         # optimizer.__class__(optimizer.param_groups, **optimizer.defaults)
-        optimizer = SAM(unwrap_model(model).parameters(), optimizer.__class__, rho=0.05, **optimizer.defaults)
+        optimizer = SAM(unwrap_model(model).parameters(), optimizer.__class__, rho=cfg.train.sam_rho, **optimizer.defaults)
         
     scheduler, _ = create_scheduler(cfg.scheduler, optimizer)
 
@@ -319,7 +328,7 @@ def main(args):
     best_acc = 0.0
     args.global_step = 0
     args.epoch = 0
-    #train loop
+    # train loop
     model.zero_grad()
     
     for epoch in range(1, total_epoch+1):
@@ -346,6 +355,7 @@ def main(args):
                 torch.save(unwrap_model(model).state_dict(), os.path.join(args.out, "best_model.pth"))
             torch.save(unwrap_model(model).state_dict(), os.path.join(args.out, "last_model.pth"))
             lr = optimizer.param_groups[0]['lr']
+            # lr = scheduler.get_last_lr()[0]
             logger.info(f"LR: {lr:.8f} Train loss: {train_loss:.3f} Valid loss: {valid_loss:.3f} Valid acc: {valid_acc:.2%}")
             if args.wandb:
                 wandb.log({
