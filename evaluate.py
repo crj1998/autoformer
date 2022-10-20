@@ -373,7 +373,6 @@ if __name__ == '__main__':
     parser.add_argument('--cfg', type=str, required=True, help='a config file')
     parser.add_argument('--out', default='../results/develop', help='directory to output the result')
     parser.add_argument('--pretrained', default=None, help='directory to pretrained model')
-    # parser.add_argument('--resume', default='', type=str, help='path to latest checkpoint (default: none)')
     parser.add_argument('--seed', default=42, type=int, help="random seed")
     parser.add_argument('--log_interval', default=64, type=int, help="log print interval")
     parser.add_argument('--wandb', action="store_true", help="use wandb")

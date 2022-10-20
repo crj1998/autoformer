@@ -69,7 +69,6 @@ class AutoFormerSpace:
             d['num_heads'].append(config.pop(f'num_heads_{i}'))
         return d
 
-
     def random(self):
         config = {
             "embed_dim": random.choice(self.search_embed_dim),
@@ -140,7 +139,7 @@ def valid(args, model, dataloader, criterion):
 def main(args):
     # set up logger
     cfg = get_config(args.cfg, args.override)
-    level = logging.DEBUG if "dev" in args.out else logging.INFO
+    level = logging.INFO
 
     # level = logging.INFO
     args.local_rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else -1
@@ -151,7 +150,7 @@ def main(args):
     args.logger = logger
     logger.debug(f"Get logger named {colorstr('AutoFormer')}!")
     logger.debug(f"Distributed available? {colorstr(str(dist.is_available()))}")
-    
+
     #setup random seed
     if args.seed is not None and isinstance(args.seed, int):
         setup_seed(args.seed)
@@ -160,7 +159,6 @@ def main(args):
         logger.info(f"Can not Setup random seed with seed is {colorstr('green', args.seed)}!")
     
     # init dist params
-    # args.n_gpu = torch.cuda.device_count()
     if args.local_rank == -1:
         args.world_size = 1
         device = torch.device('cuda')
@@ -188,18 +186,18 @@ def main(args):
 
         logger.info(f"Dataset: {colorstr('green', len(dataset))} sampels for valid!")
     # prepare dataloader
-    sampler = SequentialSampler if args.local_rank == -1 else DistributedSampler
+    sampler = SequentialSampler(dataset) if args.local_rank == -1 else DistributedSampler(dataset, shuffle=False, drop_last=False)
     batch_size = cfg.data.batch_size
     num_workers = cfg.data.num_workers
     num_classes = cfg.data.num_classes
     dataloader_config = {
-        "batch_size": 100, # batch_size//args.world_size
+        "batch_size": 250, # batch_size//args.world_size
         "num_workers": num_workers,
-        "drop_last": False,
+        # "drop_last": False,
         "pin_memory": True,
         "persistent_workers": True
     }
-    dataloader = DataLoader(dataset, sampler=sampler(dataset), **dataloader_config)
+    dataloader = DataLoader(dataset, sampler=sampler, **dataloader_config)
 
     logger.info(f"Dataloader Initialized. Batch size: {colorstr('green', batch_size)}, Num workers: {colorstr('green', num_workers)}.")
 
@@ -221,6 +219,8 @@ def main(args):
             if len(msg.missing_keys) != 0: 
                 logger.warning(f"Missing keys {msg.missing_keys} in state dict.")
             logger.info(f"Pretrained weights @: {colorstr(str(args.pretrained))} loaded!")
+        else:
+            logger.error(f"Pretrained weights @: {colorstr(str(args.pretrained))} not loaded!")
     
     model.to(args.device)
     model.eval()
@@ -245,9 +245,12 @@ def main(args):
     if name == 'evolution':
         evolution_iters = 20
         population_num = 50
-    else:
+    elif name == 'random':
         evolution_iters = 0
         population_num = 1000
+    else:
+        evolution_iters = 0
+        population_num = 32
     searcher = EvolutionSearcher(eval_func, search_space.space_to_dict(), evolution_iters=evolution_iters, population_num=population_num, optimize='max')
     topk = searcher.run([search_space.min(True), search_space.max(True)])
 
@@ -255,7 +258,7 @@ def main(args):
         if args.local_rank in [-1, 0]:
             for k, v in topk.items():
                 print(search_space.from_dict(k), v)
-            with open(f'sam_{name}.csv', 'w', newline='') as f:
+            with open(os.path.join(args.out, f'subnet_{args.name}.csv'), 'w', newline='') as f:
                 writer = csv.writer(f)
                 depth = search_space.depth
                 writer.writerow(['embed_dim', 'depth'] + [f'num_heads_{i}' for i in range(depth)] + [f'mlp_ratio_{i}' for i in range(depth)] + ['Params', 'Accs'])
@@ -272,14 +275,15 @@ if __name__ == '__main__':
     
     parser = argparse.ArgumentParser('AutoFormer training')
     parser.add_argument('--cfg', type=str, required=True, help='a config file')
-    parser.add_argument('--out', default='../results/search', help='directory to output the result')
+    parser.add_argument('--out', default='../results/search', required=True, help='directory to output the result')
     parser.add_argument('--pretrained', default=None, help='directory to pretrained model')
     # parser.add_argument('--resume', default='', type=str, help='path to latest checkpoint (default: none)')
     parser.add_argument('--seed', default=42, type=int, help="random seed")
     parser.add_argument('--name', type=str, required=True, help='search type')
     parser.add_argument('--override', default='', type=str, help='overwrite the config, keys are split by space and args split by |, such as train.eval_step=2048|optimizer.lr=0.1')
     args = parser.parse_args()
-
+    if args.pretrained is None:
+        args.pretrained = os.path.join(args.out, "best_model.pth")
     main(args)
 
 """
