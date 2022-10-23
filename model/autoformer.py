@@ -7,9 +7,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.nn import LayerNorm, Linear, Identity
-from model.module import PatchEmbed, ClsToken, AbsPosEmbed, Attention
-
+try:
+    from model.nn import LayerNorm, Linear, Identity
+    from model.module import PatchEmbed, ClsToken, AbsPosEmbed, Attention
+except:
+    from nn import LayerNorm, Linear, Identity
+    from module import PatchEmbed, ClsToken, AbsPosEmbed, Attention
 
 from timm.models.layers import DropPath, trunc_normal_
 
@@ -22,7 +25,8 @@ class TransformerEncoderLayer(nn.Module):
     def __init__(self, 
         embed_dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, 
         dropout=0., attn_dropout=0., drop_path=0., 
-        act_layer=nn.GELU, pre_norm=True, scale=False,
+        act_layer=nn.GELU, pre_norm=True, 
+        scale=False, grad_scale=True,
         relative_position=False, max_relative_position=14
     ):
         super().__init__()
@@ -43,17 +47,17 @@ class TransformerEncoderLayer(nn.Module):
 
         self.attn = Attention(
             embed_dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_dropout,
-            proj_drop=dropout, scale=self.scale, 
+            proj_drop=dropout, scale=self.scale, grad_scale=grad_scale,
             relative_position=self.relative_position, max_relative_position=max_relative_position
         )
 
-        self.attn_layer_norm = LayerNorm(embed_dim)
-        self.ffn_layer_norm = LayerNorm(embed_dim)
+        self.attn_layer_norm = LayerNorm(embed_dim, grad_scale=grad_scale)
+        self.ffn_layer_norm = LayerNorm(embed_dim, grad_scale=grad_scale)
 
         self.act_layer = act_layer()
 
-        self.fc1 = Linear(self.embed_dim, self.intermediate_dim)
-        self.fc2 = Linear(self.intermediate_dim, self.embed_dim)
+        self.fc1 = Linear(self.embed_dim, self.intermediate_dim, bias=True, grad_scale=grad_scale)
+        self.fc2 = Linear(self.intermediate_dim, self.embed_dim, bias=True, grad_scale=grad_scale)
 
         # the configs of current sampled arch
         self.sample_embed_dim = embed_dim
@@ -139,6 +143,7 @@ class VisionTransformer(nn.Module):
         drop_path_rate=0., 
         pre_norm=True, 
         scale=False, 
+        grad_scale=False,
         global_pool=False, 
         relative_position=False, 
         abs_pos = True, 
@@ -160,7 +165,7 @@ class VisionTransformer(nn.Module):
         self.global_pool = global_pool
         
         self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, grad_scale=grad_scale
         )
         # parameters for vision transformer
         num_patches = self.patch_embed.num_patches
@@ -173,7 +178,7 @@ class VisionTransformer(nn.Module):
                     embed_dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias, qk_scale=qk_scale, 
                     dropout=drop_rate, attn_dropout=attn_drop_rate, drop_path=dpr,
-                    pre_norm=pre_norm, scale=self.scale, 
+                    pre_norm=pre_norm, scale=self.scale, grad_scale=grad_scale,
                     relative_position=relative_position, max_relative_position=max_relative_position
                 )
             )
@@ -182,10 +187,10 @@ class VisionTransformer(nn.Module):
         self.cls_token = ClsToken(embed_dim)
         self.pos_embed = AbsPosEmbed(num_patches + 1, embed_dim) if abs_pos else Identity()
 
-        self.norm = LayerNorm(embed_dim) if pre_norm else Identity()
+        self.norm = LayerNorm(embed_dim, grad_scale=grad_scale) if pre_norm else Identity()
 
         # classifier head
-        self.classifier = Linear(embed_dim, num_classes) if num_classes > 0 else Identity()
+        self.classifier = Linear(embed_dim, num_classes, bias=True, grad_scale=grad_scale) if num_classes > 0 else Identity()
 
         self.apply(self._init_weights)
 
@@ -268,6 +273,7 @@ class VisionTransformer(nn.Module):
 
 if __name__ == "__main__":
     import random
+    from itertools import product
     search_space = {
         "embed_dim": [192, 216, 240],
         "depth": [12, 13, 14],
@@ -282,18 +288,69 @@ if __name__ == "__main__":
     }
     config['embed_dim'] = 192
     config['depth'] = 12
-    print(config)
+    # print(config)
     model = VisionTransformer(
         img_size=224, patch_size=16, num_classes=1000,
         embed_dim=240, depth=14, num_heads=4, mlp_ratio=4.0, qkv_bias=True, 
         drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1, global_pool=True,
-        max_relative_position=14, relative_position=True, abs_pos=True
+        max_relative_position=14, relative_position=True, abs_pos=True, grad_scale=True
     )
 
-    inputs = torch.rand(1, 3, 224, 224)
+    def mask1d(chans):
+        m = torch.arange(len(chans), 0, -1)
+        m = torch.repeat_interleave(m, torch.diff(torch.tensor([0] + chans)), dim=0)
+        return 1.0 / m
+
+    def mask2d(in_chans, out_chans):
+        m = torch.arange(len(out_chans), 0, -1).reshape(-1, 1) * torch.arange(len(in_chans), 0, -1).reshape(1, -1)
+
+        m = torch.repeat_interleave(m, torch.diff(torch.tensor([0] + out_chans)), dim=0)
+        m = torch.repeat_interleave(m, torch.diff(torch.tensor([0] + in_chans)), dim=1)
+        return 1.0 / m
+
+    def gen_mask(model, search_space):
+        state_dict = model.state_dict()
+        for i, d in enumerate(sorted(search_space['embed_dim'], reverse=True), start=1):
+            state_dict['patch_embed.proj.mask_weight'][:d] = 1.0/i
+            state_dict['patch_embed.proj.mask_bias'][:d] = 1.0/i
+        
+        for l in range(14):
+            for t in ['q', 'k', 'v']:
+                state_dict[f'layers.{l}.attn.{t}.mask_weight'] = mask2d(search_space['embed_dim'], [64*i for i in search_space['num_heads']])
+                state_dict[f'layers.{l}.attn.{t}.mask_bias'] = mask1d([64*i for i in search_space['num_heads']])
+            state_dict[f'layers.{l}.attn.proj.mask_weight'] = mask2d([64*i for i in search_space['num_heads']], search_space['embed_dim'])
+            state_dict[f'layers.{l}.attn.proj.mask_bias'] = mask1d(search_space['embed_dim'])
+
+            for t in ['attn_layer_norm', 'ffn_layer_norm']:
+                state_dict[f'layers.{l}.{t}.mask_weight'] = mask1d(search_space['embed_dim'])
+                state_dict[f'layers.{l}.{t}.mask_bias'] = mask1d(search_space['embed_dim'])
+
+            # intermediate_dim = [int(i*j) for i, j in product(search_space['embed_dim'], search_space['mlp_ratio'])]
+            # intermediate_dim = sorted(intermediate_dim)
+            # intermediate_dim = [int(i*216) for i in search_space['mlp_ratio']]
+            # state_dict[f'layers.{l}.fc1.mask_weight'] = mask2d(search_space['embed_dim'], intermediate_dim)
+            # state_dict[f'layers.{l}.fc1.mask_bias'] = mask1d(intermediate_dim)
+            # state_dict[f'layers.{l}.fc2.mask_weight'] = mask2d(intermediate_dim, search_space['embed_dim'])
+            # state_dict[f'layers.{l}.fc2.mask_bias'] = mask1d(search_space['embed_dim'])
+        state_dict[f'norm.mask_weight'] = mask1d(search_space['embed_dim'])
+        state_dict[f'norm.mask_bias'] = mask1d(search_space['embed_dim'])
+
+        state_dict[f'classifier.mask_weight'] = mask2d(search_space['embed_dim'], [1000])
+        state_dict[f'classifier.mask_bias'] = mask1d([1000])
+        return state_dict
+
+    # for k, v in model.state_dict().items():
+    #     print(k, tuple(v.shape))
+    model.load_state_dict(gen_mask(model, search_space))
+    
+    inputs = torch.rand(8, 3, 224, 224)
+    target = torch.randint(0, 3, (8, ))
     with torch.no_grad():
         logits = model(inputs)
         print(model.get_params())
         model.set_sample_config(config)
         logits = model(inputs)
         print(model.get_params())
+    
+    F.cross_entropy(model(inputs), target).backward()
+    

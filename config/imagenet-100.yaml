@@ -78,6 +78,9 @@ scheduler:
   decay_rate: 0.1
 
 train:
-  sam: true
-  sam_rho: 0.05
   sample: random
+  method: sandwich1_1
+  self_distil: false
+  sam: false
+  sam_rho: 0.00
+  

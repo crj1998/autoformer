@@ -13,14 +13,24 @@ class Identity(nn.Identity):
     def get_params(self):
         params = 0
         return params
-        
+
 
 class Linear(nn.Linear):
-    def __init__(self, in_features, out_features, bias=True):
+    def __init__(self, in_features, out_features, bias=True, grad_scale=False):
         super(Linear, self).__init__(in_features, out_features, bias=bias)
         self.sample_in_features = in_features
         self.sample_out_features = out_features
-    
+
+        if grad_scale:
+            self.register_buffer("mask_weight", torch.ones_like(self.weight))
+            mask_grad_weight = lambda grad: grad * self.mask_weight
+            self.weight.register_hook(mask_grad_weight)
+
+            self.register_buffer("mask_bias", torch.ones_like(self.bias))
+            mask_grad_bias = lambda grad: grad * self.mask_bias
+            self.bias.register_hook(mask_grad_bias)
+
+
     def set_sample_config(self, in_features, out_features):
         self.sample_in_features = in_features
         self.sample_out_features = out_features
@@ -42,10 +52,19 @@ class Linear(nn.Linear):
 
 
 class Conv2d(nn.Conv2d):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, grad_scale=False):
         super(Conv2d, self).__init__(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
         self.sample_in_channels = in_channels
         self.sample_out_channels = out_channels
+
+        if grad_scale:
+            self.register_buffer("mask_weight", torch.ones_like(self.weight))
+            mask_grad_weight = lambda grad: grad * self.mask_weight
+            self.weight.register_hook(mask_grad_weight)
+
+            self.register_buffer("mask_bias", torch.ones_like(self.bias))
+            mask_grad_bias = lambda grad: grad * self.mask_bias
+            self.bias.register_hook(mask_grad_bias)
 
     def set_sample_config(self, in_channels, out_channels):
         self.sample_in_channels = in_channels
@@ -94,10 +113,19 @@ class BatchNorm2d(nn.BatchNorm2d):
 
 
 class LayerNorm(nn.LayerNorm):
-    def __init__(self, normalized_shape, eps=1e-05, elementwise_affine=True):
+    def __init__(self, normalized_shape, eps=1e-05, elementwise_affine=True, grad_scale=False):
         super(LayerNorm, self).__init__(normalized_shape, eps, elementwise_affine)
         self.sampled_normalized_shape = self.normalized_shape
-    
+
+        if grad_scale:
+            self.register_buffer("mask_weight", torch.ones_like(self.weight))
+            mask_grad_weight = lambda grad: grad * self.mask_weight
+            self.weight.register_hook(mask_grad_weight)
+
+            self.register_buffer("mask_bias", torch.ones_like(self.bias))
+            mask_grad_bias = lambda grad: grad * self.mask_bias
+            self.bias.register_hook(mask_grad_bias)
+
     def set_sample_config(self, normalized_shape):
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape, )  

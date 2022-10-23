@@ -4,13 +4,16 @@ import torch.nn.functional as F
 
 from timm.models.layers import trunc_normal_, to_2tuple
 
-from model.nn import Conv2d, Linear
+try:
+    from model.nn import Conv2d, Linear
+except:
+    from nn import Conv2d, Linear
 
 def calc_dropout(dropout, sample_embed_dim, embed_dim):
     return dropout * sample_embed_dim / embed_dim
 
 class PatchEmbed(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, scale=False):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, scale=False, grad_scale=False):
         super(PatchEmbed, self).__init__()
 
         img_size = to_2tuple(img_size)
@@ -19,7 +22,7 @@ class PatchEmbed(nn.Module):
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
-        self.proj = Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.proj = Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=True, grad_scale=grad_scale)
         self.embed_dim = embed_dim
         self.scale = scale
 
@@ -140,7 +143,7 @@ class Attention(nn.Module):
         attn_drop=0., proj_drop=0., 
         relative_position = False,
         max_relative_position=14, 
-        scale=False
+        scale=False, grad_scale=False
     ):
         super(Attention, self).__init__()
         self.embed_dim = embed_dim
@@ -151,9 +154,9 @@ class Attention(nn.Module):
 
         self.fc_scale = scale
 
-        self.q = Linear(embed_dim, head_dim * num_heads, bias = qkv_bias)
-        self.k = Linear(embed_dim, head_dim * num_heads, bias = qkv_bias)
-        self.v = Linear(embed_dim, head_dim * num_heads, bias = qkv_bias)
+        self.q = Linear(embed_dim, head_dim * num_heads, bias=qkv_bias, grad_scale=grad_scale)
+        self.k = Linear(embed_dim, head_dim * num_heads, bias=qkv_bias, grad_scale=grad_scale)
+        self.v = Linear(embed_dim, head_dim * num_heads, bias=qkv_bias, grad_scale=grad_scale)
 
         self.relative_position = relative_position
         if relative_position:
@@ -161,7 +164,7 @@ class Attention(nn.Module):
             self.rel_pos_embed_v = RelativePosition2D(head_dim, max_relative_position)
         self.max_relative_position = max_relative_position
 
-        self.proj = Linear(head_dim * num_heads, embed_dim)
+        self.proj = Linear(head_dim * num_heads, embed_dim, bias=True, grad_scale=grad_scale)
 
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)

@@ -283,7 +283,7 @@ if __name__ == '__main__':
     parser.add_argument('--override', default='', type=str, help='overwrite the config, keys are split by space and args split by |, such as train.eval_step=2048|optimizer.lr=0.1')
     args = parser.parse_args()
     if args.pretrained is None:
-        args.pretrained = os.path.join(args.out, "best_model.pth")
+        args.pretrained = os.path.join(args.out, "last_model.pth")
     main(args)
 
 """

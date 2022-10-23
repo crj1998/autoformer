@@ -138,7 +138,6 @@ def train(args, model, dataloader, criterion, optimizer, scheduler, mixup_fn=Non
             # second forward-backward pass
             criterion(model(inputs), targets).backward()  # make sure to do a full forward pass
             optimizer.second_step(zero_grad=True)
-
         else:
             logits = model(inputs)
             if teacher_model is not None:
@@ -149,6 +148,14 @@ def train(args, model, dataloader, criterion, optimizer, scheduler, mixup_fn=Non
                     F.softmax(teacher_logits / args.distill_temp, dim=-1),
                     reduction="batchmean"
                 ) * (args.distill_temp ** 2)
+            elif args.self_distil:
+                # params_random = unwrap_model(model).get_params()
+                unwrap_model(model).set_sample_config(search_space.max())
+                # params_max = unwrap_model(model).get_params()
+                # t = params_random / params_max
+                t = 1.0
+                logits_max = model(inputs)
+                loss = criterion(logits_max, targets) + F.kl_div(F.log_softmax(logits, dim=-1), F.softmax(logits_max.detach() * t, dim=-1), reduction="batchmean")
             else:
                 loss = criterion(logits, targets)
 
@@ -301,6 +308,7 @@ def main(args):
     args.valid_step = len(train_loader)
     args.sam = cfg.train.sam
     args.sample = cfg.train.sample
+    args.self_distil = cfg.train.self_distil
     # criterion = nn.CrossEntropyLoss(reduction='mean').to(args.device)
     # optimizer = optim.AdamW(unwrap_model(model).parameters(), lr=0.001, betas=(0.9, 0.999), eps=1e-08)
     # scheduler = cosine_schedule_with_warmup(
@@ -368,7 +376,7 @@ def main(args):
                 }, step=epoch)
 
 if __name__ == '__main__':
-    
+    import shutil
     parser = argparse.ArgumentParser('AutoFormer training')
     parser.add_argument('--cfg', type=str, required=True, help='a config file')
     parser.add_argument('--out', default='../results/develop', help='directory to output the result')
@@ -379,6 +387,7 @@ if __name__ == '__main__':
     parser.add_argument('--wandb', action="store_true", help="use wandb")
     parser.add_argument('--override', default='', type=str, help='overwrite the config, keys are split by space and args split by |, such as train.eval_step=2048|optimizer.lr=0.1')
     args = parser.parse_args()
-
+    if os.path.exists(args.out) and args.wandb:
+        shutil.rmtree(args.out)
     os.makedirs(args.out, exist_ok=True)
     main(args)
